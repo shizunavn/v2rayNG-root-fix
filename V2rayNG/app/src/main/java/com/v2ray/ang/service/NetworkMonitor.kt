@@ -1,9 +1,11 @@
 package com.v2ray.ang.service
 
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.util.Log
 import com.v2ray.ang.AppConfig
 import com.v2ray.ang.extension.delay
 import com.v2ray.ang.util.LogUtil
@@ -30,11 +32,18 @@ class NetworkMonitor(
 ) {
     private companion object {
         const val HANDOVER_DEBOUNCE_MS = 1000L
+
+        // Plain android.util.Log: reload causes must stay readable even when the app's own log
+        // level filters LogUtil.
+        const val LOG_TAG = "NetworkMonitor"
     }
 
     private var upstream: Network? = null
     private var handoverJob: Job? = null
     private var registered = false
+
+    /** Last IPv4 address seen on the upstream, used to tell a real address change from a callback storm. */
+    private var upstreamAddress: String? = null
 
     /**
      * Unfortunately registerDefaultNetworkCallback is going to return our VPN interface:
@@ -68,7 +77,30 @@ class NetworkMonitor(
             onUnderlyingNetworksChanged(arrayOf(network))
         }
 
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            if (network != upstream) return
+            // A carrier NAT lease change keeps the same Network object and interface, so neither
+            // onAvailable nor onLost fires; only the address moves and every established socket
+            // dies silently. This callback is the event for exactly that, so react on a changed
+            // address alone. Capabilities and routes change constantly, hence the narrow test.
+            val address = linkProperties.linkAddresses
+                .firstOrNull { it.address.hostAddress?.contains(':') == false }
+                ?.address
+                ?.hostAddress
+            if (address == null || address == upstreamAddress) return
+
+            val previous = upstreamAddress
+            upstreamAddress = address
+            if (previous == null) {
+                Log.i(LOG_TAG, "upstream address $address")
+                return
+            }
+            Log.i(LOG_TAG, "upstream address changed $previous -> $address")
+            scheduleHandover(network)
+        }
+
         override fun onLost(network: Network) {
+            if (network == upstream) upstreamAddress = null
             onUnderlyingNetworksChanged(null)
         }
     }
@@ -103,15 +135,17 @@ class NetworkMonitor(
     }
 
     private fun scheduleHandover(network: Network) {
-        LogUtil.i(AppConfig.TAG, "NetworkMonitor: Upstream is now $network")
+        Log.i(LOG_TAG, "handover scheduled for $network")
         handoverJob?.cancel()
         handoverJob = CoroutineScope(Dispatchers.IO).launch {
             try {
                 delay(HANDOVER_DEBOUNCE_MS)
+                Log.i(LOG_TAG, "reloading core after handover")
                 onHandover()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                Log.i(LOG_TAG, "handover reload failed: ${e.message ?: e.javaClass.simpleName}")
                 LogUtil.e(AppConfig.TAG, "NetworkMonitor: Failed to handle upstream change", e)
             }
         }
