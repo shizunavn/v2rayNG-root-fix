@@ -18,7 +18,9 @@ import java.net.MalformedURLException
 import java.net.Proxy
 import java.net.URI
 import java.net.URL
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 object HttpUtil {
 
@@ -100,6 +102,84 @@ object HttpUtil {
             return null
         }
     }
+
+    /**
+     * Resolves [host] without letting a freshly reconnected network stall the caller.
+     *
+     * [InetAddress.getAllByName] goes through the system resolver, which right after the device
+     * reconnects still serves the previous network and burns its full per-nameserver timeout
+     * (measured 4.2 s). Waiting that long leaves the device offline for no reason, but giving up
+     * is not an option either: the resolve may still be about to succeed, and dropping the result
+     * starts the core without an address for its server, which then cannot connect at all.
+     *
+     * The last known answer is kept, so a reload reuses it straight away and refreshes the cache
+     * in the background. Only a host that has never resolved makes the caller wait, and then only
+     * up to [totalTimeoutMs].
+     */
+    fun resolveHostToIPBounded(
+        host: String,
+        ipv6Preferred: Boolean = false,
+        timeoutMs: Long = 1500,
+        totalTimeoutMs: Long = 10_000,
+    ): List<String>? {
+        cache[host]?.let { entry ->
+            if (System.currentTimeMillis() - entry.first >= CACHE_TTL_MS && refreshing.add(host)) {
+                // Serve the stale answer now and refresh it behind the caller's back: a reload is
+                // exactly when the resolver is least likely to answer quickly.
+                Thread({
+                    resolveHostToIP(host, ipv6Preferred)?.takeIf { it.isNotEmpty() }?.let {
+                        cache[host] = System.currentTimeMillis() to it
+                    }
+                    refreshing.remove(host)
+                }, "refresh-$host").apply { isDaemon = true }.start()
+            }
+            return entry.second
+        }
+
+        val result = resolveWithRetry(host, ipv6Preferred, timeoutMs, totalTimeoutMs)
+        if (!result.isNullOrEmpty()) {
+            cache[host] = System.currentTimeMillis() to result
+        }
+        return result
+    }
+
+    private fun resolveWithRetry(
+        host: String,
+        ipv6Preferred: Boolean,
+        timeoutMs: Long,
+        totalTimeoutMs: Long,
+    ): List<String>? {
+        val deadline = System.currentTimeMillis() + totalTimeoutMs
+        var wait = timeoutMs
+        while (true) {
+            val task = FutureTask<List<String>?> { resolveHostToIP(host, ipv6Preferred) }
+            Thread(task, "resolve-$host").apply { isDaemon = true }.start()
+            try {
+                val result = task.get(wait, TimeUnit.MILLISECONDS)
+                if (!result.isNullOrEmpty()) {
+                    return result
+                }
+            } catch (e: TimeoutException) {
+                // The lookup is still running; the retry below starts a fresh one rather than
+                // cancelling this thread, because InetAddress ignores interrupts on Android.
+                LogUtil.w(AppConfig.TAG, "Resolve still pending for $host after ${wait} ms")
+            } catch (e: Exception) {
+                LogUtil.e(AppConfig.TAG, "Failed to resolve $host", e)
+                return null
+            }
+
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) {
+                LogUtil.e(AppConfig.TAG, "Gave up resolving $host after ${totalTimeoutMs} ms")
+                return null
+            }
+            wait = minOf(remaining, 2000)
+        }
+    }
+
+    private val refreshing = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<String>>>()
+    private const val CACHE_TTL_MS = 10 * 60 * 1000L
 
 
     /**

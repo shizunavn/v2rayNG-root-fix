@@ -305,25 +305,33 @@ object CoreServiceManager {
 
             isReloading = true
             connectionTestScope.coroutineContext.cancelChildren()
-            Log.i(RELOAD_TAG, "reloadCore starting: drop tunnel, then stopLoop + launchCore")
+            Log.i(RELOAD_TAG, "reloadCore starting")
 
             // launchCore resolves the outbound domains to bake into the config, and this uid's
-            // DNS is marked into the tunnel, which is exactly what just died. Tear the tunnel
-            // down first so the resolver uses the fresh network, the same way a manual Connect
-            // does via CoreRootService. Otherwise the resolve fails and the new core starts with
-            // empty DNS hosts for domains it will never be able to look up again.
+            // DNS is marked into the tunnel, which is exactly what just died. Stop capturing so
+            // that resolve uses the fresh network, the same way a manual Connect does via
+            // CoreRootService. Otherwise the resolve fails and the new core starts with empty DNS
+            // hosts for domains it will never be able to look up again.
+            //
+            // Only the marking chain is flushed, not the whole rule set: policy routing, the
+            // tun and its default route are still valid, because the helper recreates the tun
+            // under the same name. A full stop/start costs 128 iptables invocations at ~39 ms
+            // each and kept the device offline for seconds; this is two calls.
             if (isRoot) {
-                RootProxyManager.stop(service)
+                RootProxyManager.suspendCapture(service)
             }
 
             coreController.stopLoop()
             launchCore(service, tunFd, isReload = true)
 
             if (isRoot) {
-                // The core is up again, so its SOCKS inbound can carry the tunnel. Bring the
-                // rules and tun2socks back in one step; start() tears down before installing.
-                if (!RootProxyManager.start(service)) {
-                    throw IllegalStateException("root tunnel setup failed")
+                // The core is up again, so its SOCKS inbound can carry the tunnel. The helper has
+                // to restart because it holds the tun the old core was reading from.
+                if (!RootProxyManager.resumeCapture(service)) {
+                    throw IllegalStateException("could not restore traffic capture")
+                }
+                if (!RootProxyManager.restartTun2socks(service)) {
+                    throw IllegalStateException("could not restart tun2socks")
                 }
             }
 

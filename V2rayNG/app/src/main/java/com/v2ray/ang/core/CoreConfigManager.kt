@@ -1097,7 +1097,7 @@ object CoreConfigManager {
                 continue
             }
 
-            val resolvedIps = HttpUtil.resolveHostToIP(domain, preferIpv6)
+            val resolvedIps = HttpUtil.resolveHostToIPBounded(domain, preferIpv6)
             if (resolvedIps.isNullOrEmpty()) {
                 continue
             }

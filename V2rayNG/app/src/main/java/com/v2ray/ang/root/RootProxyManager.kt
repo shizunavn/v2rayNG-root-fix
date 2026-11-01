@@ -90,6 +90,53 @@ object RootProxyManager {
         RootShell.runScript(context, "teardown_rules.sh", buildTeardown(context))
     }
 
+    // ------------------------------------------------------- RELOAD SUPPORT
+
+    /**
+     * Stops capturing the device's traffic without touching routing, the tun or the helper.
+     *
+     * A core reload has to resolve outbound domains before it can rebuild the config, and this
+     * uid's DNS is marked into the tunnel. Emptying the marking chain lets that resolve use the
+     * fresh network while the policy routing stays in place, so nothing has to be rebuilt
+     * afterwards. Flushing one chain costs a single iptables call; the full teardown/install
+     * cycle costs 128 of them and is what made a reload take seconds.
+     */
+    fun suspendCapture(context: Context): Boolean {
+        val result = RootShell.runScript(
+            context,
+            "suspend_capture.sh",
+            "iptables -w 10 -t mangle -F $CHAIN 2>/dev/null || true\necho done\n",
+        )
+        return result.success
+    }
+
+    /**
+     * Puts the marking chain back exactly as [start] installs it. The chain and its jump from
+     * OUTPUT survive [suspendCapture], so only the rules inside it have to be restored.
+     */
+    fun resumeCapture(context: Context): Boolean {
+        val appUid = context.applicationInfo.uid
+        val perAppEnabled = MmkvManager.decodeSettingsBool(AppConfig.PREF_PER_APP_PROXY)
+        val bypassApps = MmkvManager.decodeSettingsBool(AppConfig.PREF_BYPASS_APPS)
+        val selectedUids = if (perAppEnabled) {
+            val pkgs = MmkvManager.decodeSettingsStringSet(AppConfig.PREF_PER_APP_PROXY_SET)?.toList().orEmpty()
+            if (pkgs.isNotEmpty()) PackageUidResolver.packageNamesToUids(context, pkgs) else emptyList()
+        } else {
+            emptyList()
+        }
+        val script = buildMangleMarking("iptables -w 10", appUid, perAppEnabled, bypassApps, selectedUids) +
+            "echo done\n"
+        val result = RootShell.runScript(context, "resume_capture.sh", script)
+        return result.success
+    }
+
+    /** Restarts only the tun2socks helper, leaving every rule in place. */
+    fun restartTun2socks(context: Context): Boolean {
+        val script = buildTun2socksSetup(context, onlyHelper = true) ?: return false
+        val result = RootShell.runScript(context, "restart_tun2socks.sh", script)
+        return result.success
+    }
+
     // --------------------------------------------------------------- TUN2SOCKS
 
     /**
@@ -103,6 +150,7 @@ object RootProxyManager {
         context: Context,
         captureDeviceTraffic: Boolean = true,
         forceLanShare: Boolean = false,
+        onlyHelper: Boolean = false,
     ): String? {
         val bin = File(context.applicationInfo.nativeLibraryDir, AppConfig.ROOT_TUN2SOCKS_BIN)
         if (!bin.exists()) {
@@ -143,15 +191,29 @@ object RootProxyManager {
         }
 
         return buildString {
-            appendLine("set -e")
-            appendLine("BIN='${bin.absolutePath}'")
-            // Protect the core (this app process) from the Android low-memory killer.
-            // system_server keeps recomputing oom_score_adj for app processes, so a single
-            // write would be reverted — re-pin it from a small root loop instead.
-            appendLine("nohup sh -c 'while true; do echo ${AppConfig.ROOT_OOM_SCORE} > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 5; done' >/dev/null 2>&1 &")
-            appendLine("echo \$! > '$oomGuardPid'")
-            // tun device node
-            appendLine("if [ ! -e /dev/net/tun ]; then mkdir -p /dev/net; mknod /dev/net/tun c 10 200; chmod 666 /dev/net/tun; fi")
+            if (onlyHelper) {
+                // Restart the helper alone: kill the old process and start a new one against the
+                // already-installed rules. The tun comes back under the same name, so the policy
+                // routing and the marking chain keep pointing at it. This is the cheap half of a
+                // reload — the full sequence is ~128 iptables calls, this is two.
+                appendLine("PID=\$(cat '$pidFile' 2>/dev/null)")
+                appendLine("[ -n \"\$PID\" ] && kill \$PID 2>/dev/null || true")
+                appendLine("i=0; while [ \$i -lt 20 ]; do [ -d /proc/\$PID ] || break; sleep 0.1; i=\$((i+1)); done")
+                appendLine("if [ -d /proc/\$PID ]; then kill -9 \$PID 2>/dev/null || true; sleep 0.2; fi")
+                appendLine("rm -f '$pidFile'")
+                appendLine("set -e")
+                appendLine("BIN='${bin.absolutePath}'")
+            } else {
+                appendLine("set -e")
+                appendLine("BIN='${bin.absolutePath}'")
+                // Protect the core (this app process) from the Android low-memory killer.
+                // system_server keeps recomputing oom_score_adj for app processes, so a single
+                // write would be reverted — re-pin it from a small root loop instead.
+                appendLine("nohup sh -c 'while true; do echo ${AppConfig.ROOT_OOM_SCORE} > /proc/$corePid/oom_score_adj 2>/dev/null; sleep 5; done' >/dev/null 2>&1 &")
+                appendLine("echo \$! > '$oomGuardPid'")
+                // tun device node
+                appendLine("if [ ! -e /dev/net/tun ]; then mkdir -p /dev/net; mknod /dev/net/tun c 10 200; chmod 666 /dev/net/tun; fi")
+            }
             // The HEV config is written separately by the app process. Never place credentials
             // in this root shell script, even when YAML quoting would otherwise be valid.
             appendLine("nohup \"\$BIN\" '$cfgPath' >'$logFile' 2>&1 &")
@@ -161,8 +223,11 @@ object RootProxyManager {
             // wait for the interface hev creates to appear
             appendLine("i=0; while [ \$i -lt 20 ]; do ip link show $TUN >/dev/null 2>&1 && break; sleep 0.3; i=\$((i+1)); done")
             appendLine("ip link show $TUN >/dev/null 2>&1 || { echo 'tun device did not come up'; cat '$logFile' 2>/dev/null; exit 1; }")
-            // relax reverse-path filtering for the tun
-            appendLine("echo 0 > /proc/sys/net/ipv4/conf/$TUN/rp_filter 2>/dev/null || true")
+            if (onlyHelper) {
+                appendLine("echo done")
+            } else {
+                // relax reverse-path filtering for the tun
+                appendLine("echo 0 > /proc/sys/net/ipv4/conf/$TUN/rp_filter 2>/dev/null || true")
             appendLine("echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true")
             // address + default route in a dedicated table
             appendLine("ip addr add ${AppConfig.ROOT_TUN_ADDR_V4} dev $TUN 2>/dev/null || true")
@@ -198,6 +263,7 @@ object RootProxyManager {
                     // fall back to v4-through-proxy, matching what a v4-only VpnService does.
                     append(buildV6Blackhole(appUid, perAppEnabled, bypassApps, selectedUids))
                 }
+            }
             }
         }
     }
