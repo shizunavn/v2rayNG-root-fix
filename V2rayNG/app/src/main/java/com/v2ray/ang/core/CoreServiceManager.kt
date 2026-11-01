@@ -9,6 +9,7 @@ import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.system.OsConstants
 import androidx.core.content.ContextCompat
 import com.v2ray.ang.AppConfig
@@ -25,9 +26,12 @@ import com.v2ray.ang.handler.NotificationManager
 import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SpeedtestManager
 import com.v2ray.ang.helper.MessageHelper
+import com.v2ray.ang.root.RootProxyManager
+import com.v2ray.ang.service.CoreRootService
 import com.v2ray.ang.service.DialerNativeService
 import com.v2ray.ang.service.DialerWebviewService
 import com.v2ray.ang.service.NetworkMonitor
+import com.v2ray.ang.service.NetworkWatchdog
 import com.v2ray.ang.util.LogUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
@@ -46,12 +50,17 @@ import java.net.InetSocketAddress
 
 object CoreServiceManager {
 
+    // Plain android.util.Log: reload decisions happen on a background thread and must stay
+    // visible even when the app's own log level filters LogUtil.
+    private const val RELOAD_TAG = "CoreReload"
+
     private val coreController: CoreController = CoreNativeManager.newCoreController(CoreCallback())
     private val mMsgReceive = ReceiveMessageHandler()
     private var currentConfig: ProfileItem? = null
     private var processFinder: XrayProcessFinder? = null
     private var browserDialer: IDialerService? = null
     private var networkMonitor: NetworkMonitor? = null
+    private var networkWatchdog: NetworkWatchdog? = null
     private val connectionTestScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
@@ -123,6 +132,7 @@ object CoreServiceManager {
         currentVpnInterface = vpnInterface
         launchCore(service, vpnInterface)
         startNetworkMonitor(service)
+        startNetworkWatchdog(service)
     }
 
     @Throws(Exception::class)
@@ -195,6 +205,8 @@ object CoreServiceManager {
 
         networkMonitor?.unregister()
         networkMonitor = null
+        networkWatchdog?.stop()
+        networkWatchdog = null
         currentVpnInterface = null
 
         if (isRunning()) {
@@ -244,6 +256,23 @@ object CoreServiceManager {
     }
 
     /**
+     * Health-checks the local SOCKS inbound and reloads the core when it stops passing traffic,
+     * covering upstream address changes that NetworkMonitor cannot observe. Skipped in VPN mode:
+     * there the core and hev-socks5-tunnel share the VPN process and the SOCKS inbound has no
+     * direct route, while a re-established VpnService already triggers the handover path.
+     */
+    private fun startNetworkWatchdog(service: Service) {
+        if (networkWatchdog != null) return
+        if (SettingsManager.isVpnMode()) return
+
+        networkWatchdog = NetworkWatchdog(
+            context = service,
+            socksPort = { SettingsManager.getSocksPort() },
+            onDead = { reloadCore() },
+        ).also { it.start() }
+    }
+
+    /**
      * Restarts the core in place after the upstream network changed: the service, the notification
      * and the VPN interface all stay up, so nothing of this is visible.
      *
@@ -253,24 +282,56 @@ object CoreServiceManager {
      * @return True if the core is running again.
      */
     private fun reloadCore(): Boolean {
-        if (isReloading) return false
-        val service = getService() ?: return false
-        if (!isRunning()) return false
+        if (isReloading) {
+            Log.i(RELOAD_TAG, "reloadCore skipped: a reload is already in flight")
+            return false
+        }
+        val service = getService()
+        if (service == null) {
+            Log.i(RELOAD_TAG, "reloadCore skipped: service reference is gone")
+            return false
+        }
+        if (!isRunning()) {
+            Log.i(RELOAD_TAG, "reloadCore skipped: core is not running")
+            return false
+        }
 
         return try {
             val tunFd = currentVpnInterface
+            // Root mode is identified by the service class, the same way CoreRootService starts
+            // the tunnel: reading the MMKV preference here fails because it is not initialised
+            // in this call path, which silently skipped the tunnel rebuild.
+            val isRoot = service is CoreRootService
 
             isReloading = true
             connectionTestScope.coroutineContext.cancelChildren()
-            LogUtil.i(AppConfig.TAG, "StartCore-Manager: Core reload start...")
+            Log.i(RELOAD_TAG, "reloadCore starting: drop tunnel, then stopLoop + launchCore")
+
+            // launchCore resolves the outbound domains to bake into the config, and this uid's
+            // DNS is marked into the tunnel, which is exactly what just died. Tear the tunnel
+            // down first so the resolver uses the fresh network, the same way a manual Connect
+            // does via CoreRootService. Otherwise the resolve fails and the new core starts with
+            // empty DNS hosts for domains it will never be able to look up again.
+            if (isRoot) {
+                RootProxyManager.stop(service)
+            }
 
             coreController.stopLoop()
             launchCore(service, tunFd, isReload = true)
 
-            LogUtil.i(AppConfig.TAG, "StartCore-Manager: Core reload finished")
+            if (isRoot) {
+                // The core is up again, so its SOCKS inbound can carry the tunnel. Bring the
+                // rules and tun2socks back in one step; start() tears down before installing.
+                if (!RootProxyManager.start(service)) {
+                    throw IllegalStateException("root tunnel setup failed")
+                }
+            }
+
+            Log.i(RELOAD_TAG, "reloadCore finished")
             true
         } catch (e: Exception) {
             val message = e.message?.takeUnless { it.isBlank() } ?: e.javaClass.simpleName
+            Log.i(RELOAD_TAG, "reloadCore failed: $message")
             LogUtil.e(AppConfig.TAG, "StartCore-Manager: Failed to reload core: $message", e)
             MessageHelper.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, message)
             false
