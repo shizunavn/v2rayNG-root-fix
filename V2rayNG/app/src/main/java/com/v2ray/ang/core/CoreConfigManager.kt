@@ -1097,7 +1097,14 @@ object CoreConfigManager {
                 continue
             }
 
-            val resolvedIps = HttpUtil.resolveHostToIPBounded(domain, preferIpv6)
+            // Root mode reloads the core whenever the network changes, and the system resolver is
+            // unresponsive right after a reconnect, so the lookup must not block it. VPN mode has
+            // its own handover path and keeps the plain lookup.
+            val resolvedIps = if (SettingsManager.isRootMode()) {
+                HttpUtil.resolveHostToIPBounded(domain, preferIpv6)
+            } else {
+                HttpUtil.resolveHostToIP(domain, preferIpv6)
+            }
             if (resolvedIps.isNullOrEmpty()) {
                 continue
             }

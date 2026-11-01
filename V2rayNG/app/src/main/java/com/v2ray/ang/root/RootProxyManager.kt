@@ -191,16 +191,21 @@ object RootProxyManager {
         }
 
         return buildString {
+            // Kill every helper by process name, not just the one the pid file names. A helper is
+            // a root process with PPID 1, so force-stopping the app leaves it alive and the pid
+            // file only ever names the newest one; the leftovers keep the tun open and fight the
+            // replacement for it, which is what made the first Connect after a restart silently
+            // do nothing. Matches the basename only, so the app's own path never matches.
+            val binName = bin.name
+            appendLine("for P in \$(pidof '$binName' 2>/dev/null); do kill \$P 2>/dev/null || true; done")
+            appendLine("i=0; while [ \$i -lt 20 ]; do [ -z \"\$(pidof '$binName' 2>/dev/null)\" ] && break; sleep 0.1; i=\$((i+1)); done")
+            appendLine("for P in \$(pidof '$binName' 2>/dev/null); do kill -9 \$P 2>/dev/null || true; done")
+            appendLine("rm -f '$pidFile'")
             if (onlyHelper) {
-                // Restart the helper alone: kill the old process and start a new one against the
-                // already-installed rules. The tun comes back under the same name, so the policy
-                // routing and the marking chain keep pointing at it. This is the cheap half of a
-                // reload — the full sequence is ~128 iptables calls, this is two.
-                appendLine("PID=\$(cat '$pidFile' 2>/dev/null)")
-                appendLine("[ -n \"\$PID\" ] && kill \$PID 2>/dev/null || true")
-                appendLine("i=0; while [ \$i -lt 20 ]; do [ -d /proc/\$PID ] || break; sleep 0.1; i=\$((i+1)); done")
-                appendLine("if [ -d /proc/\$PID ]; then kill -9 \$PID 2>/dev/null || true; sleep 0.2; fi")
-                appendLine("rm -f '$pidFile'")
+                // Restart the helper alone: start a new one against the already-installed rules.
+                // The tun comes back under the same name, so the policy routing and the marking
+                // chain keep pointing at it. This is the cheap half of a reload — the full
+                // sequence is ~128 iptables calls, this is two.
                 appendLine("set -e")
                 appendLine("BIN='${bin.absolutePath}'")
             } else {
@@ -233,6 +238,10 @@ object RootProxyManager {
             appendLine("ip addr add ${AppConfig.ROOT_TUN_ADDR_V4} dev $TUN 2>/dev/null || true")
             appendLine("ip link set dev $TUN up")
             appendLine("ip route replace default dev $TUN table $TABLE")
+            // `add` fails with RTNETLINK "File exists" when a previous run left the rule behind
+            // (force-stop kills the app but not the root helper), which aborts the whole script
+            // under `set -e` and leaves the tunnel half built.
+            appendLine("ip rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip rule add fwmark $MARK table $TABLE priority $PRIORITY")
             // mark the device's own packets into the tun (Root mode only)
             if (captureDeviceTraffic) {
