@@ -340,17 +340,12 @@ object RootProxyManager {
      */
     private fun buildDnsDnat(cmd: String): String {
         val dnsChain = AppConfig.ROOT_DNS_OUT_CHAIN
-        val dns = SettingsManager.getRemoteDnsServers()
-            .firstOrNull { Utils.isPureIpAddress(it) && !it.contains(":") }
-            ?: AppConfig.ROOT_LAN_DNS
-        val lanCidrs = if (cmd == "ip6tables") bypassCidrsV6 else bypassCidrs
         return buildString {
             appendLine("$cmd -t nat -N $dnsChain 2>/dev/null || true")
             appendLine("$cmd -t nat -F $dnsChain")
-            lanCidrs.forEach {
-                appendLine("$cmd -t nat -A $dnsChain -d $it -p udp --dport 53 -j DNAT --to $dns")
-                appendLine("$cmd -t nat -A $dnsChain -d $it -p tcp --dport 53 -j DNAT --to $dns")
-            }
+            // DNS is captured by the mangle MARK in buildMangleMarking and resolved by the core,
+            // which honours the app's own DNS settings (udp / tcp / doh / doq). Rewriting queries
+            // to a fixed plaintext resolver here would override that choice and leak the query.
             appendLine("$cmd -t nat -D OUTPUT -j $dnsChain 2>/dev/null || true")
             appendLine("$cmd -t nat -A OUTPUT -j $dnsChain")
         }
