@@ -171,13 +171,13 @@ object RootProxyManager {
             appendLine("ip rule add fwmark $MARK table $TABLE priority $PRIORITY")
             // mark the device's own packets into the tun (Root mode only)
             if (captureDeviceTraffic) {
-                append(buildMangleMarking("iptables", appUid, perAppEnabled, bypassApps, selectedUids))
+                append(buildMangleMarking("iptables -w 10", appUid, perAppEnabled, bypassApps, selectedUids))
                 // DNS DNAT: rewrite DNS queries destined for LAN/private resolvers to a
                 // public IP so the core's routing engine can resolve them via the configured
                 // remote DNS (dns-out) instead of falling through to a geoip:private → direct
                 // rule that sends the query back to the LAN resolver (ISP DNS poisoning /
                 // CDN mis-resolution). Mirrors the tethered-client DNAT in buildLanShareSetup.
-                append(buildDnsDnat("iptables"))
+                append(buildDnsDnat("iptables -w 10"))
             }
             // optionally route hotspot / USB-tethered clients through the tun too
             if (lanShare) {
@@ -191,8 +191,8 @@ object RootProxyManager {
                     appendLine("ip -6 addr add ${AppConfig.ROOT_TUN_ADDR_V6} dev $TUN 2>/dev/null || true")
                     appendLine("ip -6 route replace default dev $TUN table $TABLE 2>/dev/null || true")
                     appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
-                    append(buildMangleMarking("ip6tables", appUid, perAppEnabled, bypassApps, selectedUids))
-                    append(buildDnsDnat("ip6tables"))
+                    append(buildMangleMarking("ip6tables -w 10", appUid, perAppEnabled, bypassApps, selectedUids))
+                    append(buildDnsDnat("ip6tables -w 10"))
                 } else {
                     // v6 disabled: blackhole native v6 egress for the captured apps so they
                     // fall back to v4-through-proxy, matching what a v4-only VpnService does.
@@ -303,7 +303,7 @@ object RootProxyManager {
             appendLine("$cmd -t mangle -A $CHAIN -p udp --dport 53 -j MARK --set-xmark $MARK")
             appendLine("$cmd -t mangle -A $CHAIN -p tcp --dport 53 -j MARK --set-xmark $MARK")
             // keep LAN / private destinations direct (per-family CIDR list)
-            val cidrs = if (cmd == "ip6tables") bypassCidrsV6 else bypassCidrs
+            val cidrs = if (cmd.startsWith("ip6tables")) bypassCidrsV6 else bypassCidrs
             cidrs.forEach { appendLine("$cmd -t mangle -A $CHAIN -d $it -j RETURN") }
             if (allowMode) {
                 // Proxy ONLY the explicitly selected apps. If nothing resolved (e.g. the
@@ -374,27 +374,27 @@ object RootProxyManager {
         val bypassSelected = perAppEnabled && bypassApps && selectedUids.isNotEmpty()
         val reject = "-j REJECT --reject-with icmp6-adm-prohibited"
         return buildString {
-            appendLine("ip6tables -t filter -N $chain 2>/dev/null || true")
-            appendLine("ip6tables -t filter -F $chain")
+            appendLine("ip6tables -w 10 -t filter -N $chain 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t filter -F $chain")
             // never touch the helper, the core, loopback, NDP/link-local/multicast or LAN
-            appendLine("ip6tables -t filter -A $chain -m mark --mark $FWMARK -j RETURN")
-            appendLine("ip6tables -t filter -A $chain -m owner --uid-owner $appUid -j RETURN")
-            appendLine("ip6tables -t filter -A $chain -o lo -j RETURN")
-            bypassCidrsV6.forEach { appendLine("ip6tables -t filter -A $chain -d $it -j RETURN") }
+            appendLine("ip6tables -w 10 -t filter -A $chain -m mark --mark $FWMARK -j RETURN")
+            appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $appUid -j RETURN")
+            appendLine("ip6tables -w 10 -t filter -A $chain -o lo -j RETURN")
+            bypassCidrsV6.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -d $it -j RETURN") }
             // bypass mode: bypassed apps keep their native v6
             if (bypassSelected) {
-                selectedUids.forEach { appendLine("ip6tables -t filter -A $chain -m owner --uid-owner $it -j RETURN") }
+                selectedUids.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $it -j RETURN") }
             }
             if (allowMode) {
                 // proxy mode: only the selected apps lose v6 (so they fall back to v4-via-proxy).
                 // None resolved -> reject nothing, mirroring the v4 chain's fail-closed handling.
-                selectedUids.forEach { appendLine("ip6tables -t filter -A $chain -m owner --uid-owner $it $reject") }
+                selectedUids.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $it $reject") }
             } else {
                 // all-apps / bypass: reject everyone left
-                appendLine("ip6tables -t filter -A $chain $reject")
+                appendLine("ip6tables -w 10 -t filter -A $chain $reject")
             }
-            appendLine("ip6tables -t filter -D OUTPUT -j $chain 2>/dev/null || true")
-            appendLine("ip6tables -t filter -A OUTPUT -j $chain")
+            appendLine("ip6tables -w 10 -t filter -D OUTPUT -j $chain 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t filter -A OUTPUT -j $chain")
         }
     }
 
@@ -422,24 +422,24 @@ object RootProxyManager {
             appendLine("set +e")
             appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true")
             // forward traffic to/from the tun
-            appendLine("iptables -N $fwd 2>/dev/null || true")
-            appendLine("iptables -F $fwd")
-            appendLine("iptables -A $fwd -i $TUN -j ACCEPT")
-            appendLine("iptables -A $fwd -o $TUN -j ACCEPT")
-            appendLine("iptables -D FORWARD -j $fwd 2>/dev/null || true")
-            appendLine("iptables -I FORWARD -j $fwd")
+            appendLine("iptables -w 10 -N $fwd 2>/dev/null || true")
+            appendLine("iptables -w 10 -F $fwd")
+            appendLine("iptables -w 10 -A $fwd -i $TUN -j ACCEPT")
+            appendLine("iptables -w 10 -A $fwd -o $TUN -j ACCEPT")
+            appendLine("iptables -w 10 -D FORWARD -j $fwd 2>/dev/null || true")
+            appendLine("iptables -w 10 -I FORWARD -j $fwd")
             // clamp MSS to avoid TLS fragmentation overhead through the tunnel
-            appendLine("iptables -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
-            appendLine("iptables -t mangle -A FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350")
+            appendLine("iptables -w 10 -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
+            appendLine("iptables -w 10 -t mangle -A FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350")
             // hijack tethered clients' DNS into a dedicated chain so it resolves through the
             // tunnel; the chain keeps teardown independent of the resolver IP
-            appendLine("iptables -t nat -N $dnsChain 2>/dev/null || true")
-            appendLine("iptables -t nat -F $dnsChain")
+            appendLine("iptables -w 10 -t nat -N $dnsChain 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -F $dnsChain")
             lanCidrs.forEach {
-                appendLine("iptables -t nat -A $dnsChain ! -i $TUN -d $it -p udp --dport 53 -j DNAT --to $dns")
+                appendLine("iptables -w 10 -t nat -A $dnsChain ! -i $TUN -d $it -p udp --dport 53 -j DNAT --to $dns")
             }
-            appendLine("iptables -t nat -D PREROUTING -j $dnsChain 2>/dev/null || true")
-            appendLine("iptables -t nat -A PREROUTING -j $dnsChain")
+            appendLine("iptables -w 10 -t nat -D PREROUTING -j $dnsChain 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -A PREROUTING -j $dnsChain")
             // policy routing: return-path via main, LAN direct, the rest via the tun table
             appendLine("ip rule add iif lo goto 6000 pref 5000 2>/dev/null || true")
             appendLine("ip rule add iif $TUN lookup main suppress_prefixlength 0 pref 5010 2>/dev/null || true")
@@ -457,10 +457,10 @@ object RootProxyManager {
             // above don't touch it, so it egresses the upstream interface directly, bypassing
             // the proxy = IPv6 leak. Handle it explicitly (mirrors vincentng295/Magic_V2Ray
             // cae4f7f): route it through the tun when v6 is enabled, reject it when it isn't.
-            appendLine("ip6tables -N $v6fwd 2>/dev/null || true")
-            appendLine("ip6tables -F $v6fwd")
-            appendLine("ip6tables -D FORWARD -j $v6fwd 2>/dev/null || true")
-            appendLine("ip6tables -I FORWARD -j $v6fwd")
+            appendLine("ip6tables -w 10 -N $v6fwd 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -F $v6fwd")
+            appendLine("ip6tables -w 10 -D FORWARD -j $v6fwd 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -I FORWARD -j $v6fwd")
             if (ipv6) {
                 // When the device itself isn't capturing v6 (VPN-mode sharing) the tun table
                 // has no v6 default and the tun has no v6 address — add them so marked client
@@ -471,27 +471,27 @@ object RootProxyManager {
                     appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
                 }
                 // allow forwarding to/from the tun
-                appendLine("ip6tables -A $v6fwd -i $TUN -j ACCEPT")
-                appendLine("ip6tables -A $v6fwd -o $TUN -j ACCEPT")
+                appendLine("ip6tables -w 10 -A $v6fwd -i $TUN -j ACCEPT")
+                appendLine("ip6tables -w 10 -A $v6fwd -o $TUN -j ACCEPT")
                 // mark forwarded (non-locally-sourced) client v6 into the tun table. DNS first
                 // so a query to a LAN/router resolver is still tunneled (MARK survives RETURN);
                 // keep loopback, link-local (NDP/RA) and ULA/multicast direct.
-                appendLine("ip6tables -t mangle -N $v6pre 2>/dev/null || true")
-                appendLine("ip6tables -t mangle -F $v6pre")
-                appendLine("ip6tables -t mangle -A $v6pre ! -i $TUN -p udp --dport 53 -j MARK --set-xmark $MARK")
-                appendLine("ip6tables -t mangle -A $v6pre ! -i $TUN -p tcp --dport 53 -j MARK --set-xmark $MARK")
-                bypassCidrsV6.forEach { appendLine("ip6tables -t mangle -A $v6pre ! -i $TUN -d $it -j RETURN") }
-                appendLine("ip6tables -t mangle -A $v6pre ! -i $TUN -j MARK --set-xmark $MARK")
-                appendLine("ip6tables -t mangle -D PREROUTING -j $v6pre 2>/dev/null || true")
-                appendLine("ip6tables -t mangle -A PREROUTING -j $v6pre")
+                appendLine("ip6tables -w 10 -t mangle -N $v6pre 2>/dev/null || true")
+                appendLine("ip6tables -w 10 -t mangle -F $v6pre")
+                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -p udp --dport 53 -j MARK --set-xmark $MARK")
+                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -p tcp --dport 53 -j MARK --set-xmark $MARK")
+                bypassCidrsV6.forEach { appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -d $it -j RETURN") }
+                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -j MARK --set-xmark $MARK")
+                appendLine("ip6tables -w 10 -t mangle -D PREROUTING -j $v6pre 2>/dev/null || true")
+                appendLine("ip6tables -w 10 -t mangle -A PREROUTING -j $v6pre")
                 // fail closed: any forwarded v6 that wasn't marked into the tun (e.g. the
                 // addrtype match is unavailable, or marking failed) is rejected rather than
                 // leaked straight out the upstream interface.
-                appendLine("ip6tables -A $v6fwd -j REJECT --reject-with icmp6-no-route")
+                appendLine("ip6tables -w 10 -A $v6fwd -j REJECT --reject-with icmp6-no-route")
             } else {
                 // v6 disabled: reject forwarded clients' native v6 so it can't leak past the
                 // proxy (the device's own v6 is blackholed separately in OUTPUT).
-                appendLine("ip6tables -A $v6fwd -j REJECT --reject-with icmp6-no-route")
+                appendLine("ip6tables -w 10 -A $v6fwd -j REJECT --reject-with icmp6-no-route")
             }
         }
     }
@@ -505,39 +505,39 @@ object RootProxyManager {
         val corePid = Process.myPid()
         return buildString {
             // mangle (TUN2SOCKS), both families
-            for (cmd in listOf("iptables", "ip6tables")) {
+            for (cmd in listOf("iptables -w 10", "ip6tables -w 10")) {
                 appendLine("$cmd -t mangle -D OUTPUT -j $CHAIN 2>/dev/null || true")
                 appendLine("$cmd -t mangle -F $CHAIN 2>/dev/null || true")
                 appendLine("$cmd -t mangle -X $CHAIN 2>/dev/null || true")
             }
             // IPv6 blackhole chain (only set up when v6 is disabled; harmless if absent)
-            appendLine("ip6tables -t filter -D OUTPUT -j ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -t filter -F ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -t filter -X ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t filter -D OUTPUT -j ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t filter -F ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t filter -X ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
             // routing rule + table
             appendLine("ip rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip -6 rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip route flush table $TABLE 2>/dev/null || true")
             appendLine("ip -6 route flush table $TABLE 2>/dev/null || true")
             // LAN / tethering sharing (always cleaned, harmless if it was never set up)
-            appendLine("iptables -D FORWARD -j ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -F ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -X ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
-            appendLine("iptables -t nat -D PREROUTING -j ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -t nat -F ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -t nat -X ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -D FORWARD -j ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -F ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -X ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -D PREROUTING -j ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -F ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -X ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
             // device DNS DNAT chain (root mode)
-            appendLine("iptables -t nat -D OUTPUT -j ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -t nat -F ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -t nat -X ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -D OUTPUT -j ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -F ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
+            appendLine("iptables -w 10 -t nat -X ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
             // IPv6 LAN-sharing chains (forward accept/reject + forwarded-client marking)
-            appendLine("ip6tables -D FORWARD -j ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -F ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -X ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -t mangle -D PREROUTING -j ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -t mangle -F ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -t mangle -X ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -D FORWARD -j ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -F ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -X ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t mangle -D PREROUTING -j ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t mangle -F ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
+            appendLine("ip6tables -w 10 -t mangle -X ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
             for (pref in listOf(5000, 5010, 5020, 5025, 5026, 5027, 5030, 5040, 5050, 6000)) {
                 appendLine("ip rule del pref $pref 2>/dev/null || true")
             }
