@@ -36,6 +36,14 @@ object RootProxyManager {
     private const val FWMARK = AppConfig.ROOT_FWMARK
     private const val MARK = AppConfig.ROOT_MARK_ROUTE
 
+    /** Root-side script that cleans up after the app if the process is killed outright. */
+    private const val GUARDIAN_SCRIPT = "guardian.sh"
+    private const val HELPER_BIN_NAME = "libhevsockstun.so"
+
+    /** The guardian has no state, so one write per process is enough. */
+    @Volatile
+    private var guardianScriptWritten = false
+
     // Local / private / multicast destinations that must never be proxied.
     private val bypassCidrs = listOf(
         "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
@@ -170,6 +178,8 @@ object RootProxyManager {
         val logFile = File(runDir, "tun2socks.log").absolutePath
         val cfgFile = File(runDir, "tun2socks.yml")
         val oomGuardPid = File(runDir, "oomguard.pid").absolutePath
+        val guardianPath = File(runDir, GUARDIAN_SCRIPT).absolutePath
+        val guardianPid = File(runDir, "guardian.pid").absolutePath
         val ipv6 = MmkvManager.decodeSettingsBool(AppConfig.PREF_IPV6_ENABLED)
         val lanShare = forceLanShare || MmkvManager.decodeSettingsBool(AppConfig.PREF_ROOT_LAN_SHARING)
         val corePid = Process.myPid()
@@ -225,6 +235,17 @@ object RootProxyManager {
             appendLine("T2S_PID=\$!")
             appendLine("echo \$T2S_PID > '$pidFile'")
             appendLine("echo ${AppConfig.ROOT_OOM_SCORE} > /proc/\$T2S_PID/oom_score_adj 2>/dev/null || true")
+            // Root mode owns the rules and the helper, and unlike a VpnService the kernel does not
+            // clean them up when the app dies. A force-stop kills this process with SIGKILL, so
+            // onDestroy never runs and the rules keep capturing every packet into a tunnel nothing
+            // serves: the device loses internet until the app is started and stopped again.
+            //
+            // The guardian keeps the same teardown the app would run, on disk, and waits for the
+            // app process to disappear. It holds no state, so it exits as soon as it has cleaned
+            // up, and a normal stop removes it with everything else.
+            writeGuardianScript(context)
+            appendLine("nohup sh '$guardianPath' $corePid >/dev/null 2>&1 &")
+            appendLine("echo \$! > '$guardianPid'")
             // wait for the interface hev creates to appear
             appendLine("i=0; while [ \$i -lt 20 ]; do ip link show $TUN >/dev/null 2>&1 && break; sleep 0.3; i=\$((i+1)); done")
             appendLine("ip link show $TUN >/dev/null 2>&1 || { echo 'tun device did not come up'; cat '$logFile' 2>/dev/null; exit 1; }")
@@ -573,11 +594,69 @@ object RootProxyManager {
 
     // ---------------------------------------------------------------- teardown
 
+    /**
+     * Writes the script the guardian runs once the app process is gone.
+     *
+     * It is the same teardown the app would run, deferred: by the time it executes the app cannot
+     * write anything, so the whole rule set has to be on disk before the app can be killed.
+     */
+    private fun writeGuardianScript(context: Context): Boolean {
+        if (guardianScriptWritten) return true
+        val runDir = File(context.filesDir, AppConfig.ROOT_RUNTIME_DIR)
+        val file = File(runDir, GUARDIAN_SCRIPT)
+        val oomGuardPid = File(runDir, "oomguard.pid").absolutePath
+        val guardianPid = File(runDir, "guardian.pid").absolutePath
+        val script = buildString {
+            appendLine("#!/system/bin/sh")
+            appendLine("CORE=\$1")
+            // The app may still be starting up when the guardian begins: wait for it to exist
+            // before waiting for it to go, otherwise an immediate exit would be cleaned up while
+            // the app is alive.
+            appendLine("i=0; while [ \$i -lt 30 ] && ! kill -0 \$CORE 2>/dev/null; do sleep 1; i=\$((i+1)); done")
+            appendLine("while kill -0 \$CORE 2>/dev/null; do sleep 2; done")
+            appendLine("sleep 2")
+            // The same body teardown() runs, minus the steps that only make sense while the app
+            // is alive (it cannot reach the core's oom_score_adj any more).
+            append(buildTeardownBody(context))
+            // The pid file names the newest helper, but a reload can leave an older one behind.
+            appendLine("for P in \$(pidof ${HELPER_BIN_NAME} 2>/dev/null); do kill -9 \$P 2>/dev/null || true; done")
+            appendLine("[ -f '$oomGuardPid' ] && kill \$(cat '$oomGuardPid') 2>/dev/null || true")
+            appendLine("rm -f '$oomGuardPid' '$guardianPid'")
+        }
+        return try {
+            file.writeText(script)
+            guardianScriptWritten = true
+            true
+        } catch (e: Exception) {
+            LogUtil.e(AppConfig.TAG, "RootProxyManager: failed to write guardian script", e)
+            false
+        }
+    }
+
     private fun buildTeardown(context: Context): String {
         val runDir = File(context.filesDir, AppConfig.ROOT_RUNTIME_DIR)
-        val pidFile = File(runDir, "tun2socks.pid").absolutePath
         val oomGuardPid = File(runDir, "oomguard.pid").absolutePath
+        val guardianPidFile = File(runDir, "guardian.pid").absolutePath
         val corePid = Process.myPid()
+        return buildString {
+            append(buildTeardownBody(context))
+            // stop the OOM re-pin loop and restore the core process's LMK priority
+            appendLine("[ -f '$oomGuardPid' ] && kill \$(cat '$oomGuardPid') 2>/dev/null || true")
+            appendLine("rm -f '$oomGuardPid'")
+            // the guardian only matters if the process dies without running this
+            appendLine("[ -f '$guardianPidFile' ] && kill \$(cat '$guardianPidFile') 2>/dev/null || true")
+            appendLine("rm -f '$guardianPidFile'")
+            appendLine("echo 0 > /proc/$corePid/oom_score_adj 2>/dev/null || true")
+        }
+    }
+
+    /**
+     * Everything teardown removes except the helper and the OOM re-pin loop, which the app and the
+     * guardian clean up in ways that suit when they run.
+     */
+    private fun buildTeardownBody(context: Context): String {
+        val runDir = File(context.filesDir, AppConfig.ROOT_RUNTIME_DIR)
+        val pidFile = File(runDir, "tun2socks.pid").absolutePath
         return buildString {
             // mangle (TUN2SOCKS), both families
             for (cmd in listOf("iptables -w 10", "ip6tables -w 10")) {
@@ -620,10 +699,6 @@ object RootProxyManager {
             appendLine("ip link set dev $TUN down 2>/dev/null || true")
             appendLine("[ -f '$pidFile' ] && kill \$(cat '$pidFile') 2>/dev/null || true")
             appendLine("rm -f '$pidFile'")
-            // stop the OOM re-pin loop and restore the core process's LMK priority
-            appendLine("[ -f '$oomGuardPid' ] && kill \$(cat '$oomGuardPid') 2>/dev/null || true")
-            appendLine("rm -f '$oomGuardPid'")
-            appendLine("echo 0 > /proc/$corePid/oom_score_adj 2>/dev/null || true")
         }
     }
 }
