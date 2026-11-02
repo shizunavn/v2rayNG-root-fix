@@ -72,7 +72,15 @@ class CoreRootService : Service(), ServiceControl {
         // tun to appear); if a stop arrives during that window, teardown would run first and
         // the setup would then re-install the rules + tun pointing at a now-dead core,
         // blackholing all traffic until the next start/stop cycle clears it.
-        runBlocking { setupJob?.cancelAndJoin() }
+        //
+        // Joining rather than cancelling matters: cancelling unwinds the coroutine between two
+        // iptables calls, so the script stops half way through installing the rule set and
+        // teardown then has to undo a state the installer never finished. Letting it land first
+        // leaves a known state for teardown to remove.
+        runBlocking { setupJob?.join() }
+        // Abort any handover reload before the rules go: it would otherwise restore the marking
+        // chain over the state teardown is clearing, which leaves the device offline.
+        CoreServiceManager.abortReload()
         // Remove routing rules BEFORE stopping the core so traffic is never redirected
         // to a dead listener. Synchronous on purpose — leaving rules behind breaks the net.
         RootProxyManager.stop(this)

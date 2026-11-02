@@ -65,9 +65,14 @@ class NetworkMonitor(
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val previous = upstream
+            val hadAddress = upstreamAddress != null
             upstream = network
             onUnderlyingNetworksChanged(arrayOf(network))
-            if (previous != null && previous != network) {
+            // Switching network means the sockets the core holds are bound to an address that is
+            // gone, so the reload is needed whenever the upstream moved. A first callback after a
+            // start still needs it when an address was seen before, because that address belonged
+            // to the network that just went away.
+            if (previous != network && (previous != null || hadAddress)) {
                 scheduleHandover(network)
             }
         }

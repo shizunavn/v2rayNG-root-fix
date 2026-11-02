@@ -195,6 +195,16 @@ object CoreServiceManager {
     }
 
     /**
+     * Makes any reload that is in flight give up instead of restoring the tunnel.
+     *
+     * Called before the rules are removed: a reload racing a stop would otherwise re-install the
+     * marking chain after teardown, leaving captured traffic pointed at the core being killed.
+     */
+    fun abortReload() {
+        isReloading = false
+    }
+
+    /**
      * Stops the V2Ray core service.
      * Unregisters broadcast receivers, stops notifications, and shuts down plugins.
      * @return True if the core was stopped successfully, false otherwise.
@@ -202,7 +212,6 @@ object CoreServiceManager {
     fun stopCoreLoop(): Boolean {
         connectionTestScope.coroutineContext.cancelChildren()
         val service = getService() ?: return false
-
         networkMonitor?.unregister()
         networkMonitor = null
         networkWatchdog?.stop()
@@ -325,6 +334,14 @@ object CoreServiceManager {
             launchCore(service, tunFd, isReload = true)
 
             if (isRoot) {
+                // The service may have been stopped while the core was restarting. Restoring the
+                // marking chain then would point every captured packet at a core that teardown is
+                // about to kill, and nothing serves it, which takes the whole device offline until
+                // the app is started and stopped again.
+                if (!isReloading) {
+                    Log.i(RELOAD_TAG, "reloadCore abandoned after restart: service is stopping")
+                    return false
+                }
                 // The core is up again, so its SOCKS inbound can carry the tunnel. The helper has
                 // to restart because it holds the tun the old core was reading from.
                 if (!RootProxyManager.resumeCapture(service)) {
