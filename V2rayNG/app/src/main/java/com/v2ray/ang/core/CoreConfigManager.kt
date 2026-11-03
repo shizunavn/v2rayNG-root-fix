@@ -1097,6 +1097,14 @@ object CoreConfigManager {
                 continue
             }
 
+            // An IP literal needs no lookup, and asking for one costs the full 10 s resolver
+            // timeout in root mode (the resolver answers nothing for a name it cannot find, and
+            // host resolution treats an empty answer as "keep trying"). Measured on the Xiaomi
+            // device: 12 s to connect instead of 1 s.
+            if (Utils.isPureIpAddress(domain)) {
+                continue
+            }
+
             // Root mode reloads the core whenever the network changes, and the system resolver is
             // unresponsive right after a reconnect, so the lookup must not block it. VPN mode has
             // its own handover path and keeps the plain lookup.

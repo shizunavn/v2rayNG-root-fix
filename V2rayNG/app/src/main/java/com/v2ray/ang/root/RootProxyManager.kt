@@ -40,6 +40,12 @@ object RootProxyManager {
     private const val GUARDIAN_SCRIPT = "guardian.sh"
     private const val HELPER_BIN_NAME = "libhevsockstun.so"
 
+    /**
+     * How many times a re-inserted rule is deleted before the chain is rebuilt. One -D per
+     * start is not enough for a rule added with -I: every start stacks another copy.
+     */
+    private const val DROP_REPEATS = 8
+
     /** The guardian has no state, so one write per process is enough. */
     @Volatile
     private var guardianScriptWritten = false
@@ -56,6 +62,122 @@ object RootProxyManager {
         "::1/128", "fe80::/10", "fc00::/7", "ff00::/8"
     )
 
+    // ------------------------------------------------------------ rule staging
+    //
+    // Each iptables invocation is a fork of a ~1 MB binary through su, and on this device that
+    // costs 20-30 ms: the ~60 calls a full setup needs were most of the ~2 s it took. The
+    // rules are therefore described as data and applied by a single iptables-restore per
+    // table, which parses them in one process.
+
+    /** One table's worth of rules, in restore syntax. */
+    private class RuleBatch(val tool: String, val table: String) {
+        val lines = mutableListOf<String>()
+
+        /**
+         * Jumps that must be re-asserted: restore cannot delete a rule, and a plain -A on every
+         * start would pile up duplicates in the built-in chains. These run as individual
+         * best-effort commands around the restore instead.
+         */
+        val drops = mutableListOf<String>()
+
+        /**
+         * Built-in chains are declared with their default policy, user chains with the `-`
+         * marker. A chain declared here exists for the rest of the batch even if this run is
+         * what creates it, so the -F that follows cannot fail on a first-time setup.
+         */
+        fun chain(chain: String, policy: String = "-") {
+            if (lines.none { it.startsWith(":$chain ") }) lines.add(":$chain $policy")
+        }
+
+        fun flush(chain: String) {
+            chain(chain)
+            lines.add("-F $chain")
+        }
+
+        /** Delete [chain]; the `:` declaration makes the -X a no-op when it never existed. */
+        fun delete(chain: String) {
+            chain(chain)
+            lines.add("-X $chain")
+        }
+
+        /** Best-effort removal of a leftover rule, run outside the restore batch. */
+        fun drop(chain: String, rule: String) {
+            drops.add("-D $chain $rule")
+        }
+
+        /**
+         * Same, for a rule the chain gets re-inserted rather than appended (-I puts a new copy
+         * at the top every time, so a single -D per start would leave a growing pile behind:
+         * measured 13 copies after 13 connects).
+         */
+        fun dropAll(chain: String, rule: String, times: Int = DROP_REPEATS) {
+            repeat(times) { drops.add("-D $chain $rule") }
+        }
+
+        fun append(chain: String, rule: String) = lines.add("-A $chain $rule")
+
+        fun insert(chain: String, rule: String) = lines.add("-I $chain $rule")
+
+        /** Jump into [target], replacing any leftover jump from a previous run. */
+        fun jump(chain: String, target: String) {
+            drop(chain, "-j $target")
+            append(chain, "-j $target")
+        }
+
+        /** Assert [rule] once, replacing the copy a previous run left behind. */
+        fun replace(chain: String, rule: String) {
+            drop(chain, rule)
+            append(chain, rule)
+        }
+    }
+
+    /**
+     * Collects the mangle/filter/nat rules (both families) built throughout setup and hands
+     * back one restore invocation per table.
+     */
+    private class RuleStager {
+        private val batches = LinkedHashMap<Pair<String, String>, RuleBatch>()
+
+        fun batch(tool: String, table: String): RuleBatch =
+            batches.getOrPut(tool to table) { RuleBatch(tool, table) }
+
+        fun script(): String = buildString {
+            for ((_, b) in batches) {
+                if (b.lines.isEmpty()) continue
+                // Drops run first, unwrapped: a missing rule is the normal case on a fresh
+                // start. Each one is already guarded by the caller's `|| true`.
+                if (b.drops.isNotEmpty()) {
+                    b.drops.forEach { appendLine("${b.tool} -w 10 -t ${b.table} $it 2>/dev/null || true") }
+                }
+                appendLine("restore ${b.tool.replace("-", "_")} ${b.table.replace("-", "_")} <<'IPT_EOF'")
+                appendLine("*${b.table}")
+                b.lines.forEach { appendLine(it) }
+                appendLine("COMMIT")
+                appendLine("IPT_EOF")
+            }
+        }
+    }
+
+    private fun mangle(stage: RuleStager, v6: Boolean = false) =
+        stage.batch(if (v6) "ip6tables" else "iptables", "mangle")
+
+    private fun nat(stage: RuleStager) = stage.batch("iptables", "nat")
+
+    private fun filter(stage: RuleStager, v6: Boolean) =
+        stage.batch(if (v6) "ip6tables" else "iptables", "filter")
+
+    /**
+     * Shell preamble for a stager. Under [strict] a failed restore aborts the script, so a
+     * half-installed rule set never outlives setup; otherwise the table is applied
+     * best-effort and the remaining tables still run.
+     */
+    private fun restorePreamble(stage: RuleStager, strict: Boolean): String {
+        val guard = if (strict) " || exit 1" else " || true"
+        return buildString {
+            appendLine("restore() { \$1-restore --noflush$guard; }")
+            append(stage.script())
+        }
+    }
     fun start(context: Context): Boolean {
         teardown(context)
         val script = buildTun2socksSetup(context) ?: return false
@@ -132,7 +254,9 @@ object RootProxyManager {
         } else {
             emptyList()
         }
-        val script = buildMangleMarking("iptables -w 10", appUid, perAppEnabled, bypassApps, selectedUids) +
+        val stage = RuleStager()
+        val script = buildMangleMarking(stage, v6 = false, appUid, perAppEnabled, bypassApps, selectedUids) +
+            restorePreamble(stage, strict = true) +
             "echo done\n"
         val result = RootShell.runScript(context, "resume_capture.sh", script)
         return result.success
@@ -183,6 +307,7 @@ object RootProxyManager {
         val ipv6 = MmkvManager.decodeSettingsBool(AppConfig.PREF_IPV6_ENABLED)
         val lanShare = forceLanShare || MmkvManager.decodeSettingsBool(AppConfig.PREF_ROOT_LAN_SHARING)
         val corePid = Process.myPid()
+        val stage = RuleStager()
 
         val config = buildHevConfig(socksUsername, socksPassword, port, ipv6, SettingsManager.getVpnMtu(), lanShare)
         if (!writeHevConfig(cfgFile, config)) {
@@ -266,17 +391,17 @@ object RootProxyManager {
             appendLine("ip rule add fwmark $MARK table $TABLE priority $PRIORITY")
             // mark the device's own packets into the tun (Root mode only)
             if (captureDeviceTraffic) {
-                append(buildMangleMarking("iptables -w 10", appUid, perAppEnabled, bypassApps, selectedUids))
+                append(buildMangleMarking(stage, v6 = false, appUid, perAppEnabled, bypassApps, selectedUids))
                 // DNS DNAT: rewrite DNS queries destined for LAN/private resolvers to a
                 // public IP so the core's routing engine can resolve them via the configured
                 // remote DNS (dns-out) instead of falling through to a geoip:private → direct
                 // rule that sends the query back to the LAN resolver (ISP DNS poisoning /
                 // CDN mis-resolution). Mirrors the tethered-client DNAT in buildLanShareSetup.
-                append(buildDnsDnat("iptables -w 10"))
+                append(buildDnsDnat(stage))
             }
             // optionally route hotspot / USB-tethered clients through the tun too
             if (lanShare) {
-                append(buildLanShareSetup(captureDeviceTraffic, ipv6))
+                append(buildLanShareSetup(stage, captureDeviceTraffic, ipv6))
             }
             if (captureDeviceTraffic) {
                 // IPv6 is best-effort: never fail the (working) IPv4 setup over it.
@@ -286,13 +411,17 @@ object RootProxyManager {
                     appendLine("ip -6 addr add ${AppConfig.ROOT_TUN_ADDR_V6} dev $TUN 2>/dev/null || true")
                     appendLine("ip -6 route replace default dev $TUN table $TABLE 2>/dev/null || true")
                     appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
-                    append(buildMangleMarking("ip6tables -w 10", appUid, perAppEnabled, bypassApps, selectedUids))
-                    append(buildDnsDnat("ip6tables -w 10"))
+                    append(buildMangleMarking(stage, v6 = true, appUid, perAppEnabled, bypassApps, selectedUids))
+                    append(buildDnsDnat(stage, v6 = true))
                 } else {
                     // v6 disabled: blackhole native v6 egress for the captured apps so they
                     // fall back to v4-through-proxy, matching what a v4-only VpnService does.
-                    append(buildV6Blackhole(appUid, perAppEnabled, bypassApps, selectedUids))
+                    append(buildV6Blackhole(stage, appUid, perAppEnabled, bypassApps, selectedUids))
                 }
+                // One restore per table instead of one process per rule. The IPv4 marking is
+                // what makes the tunnel work, so its failure aborts setup; the rest is
+                // best-effort exactly as it was when each rule ran under `|| true`.
+                append(restorePreamble(stage, strict = false))
             }
             }
         }
@@ -369,25 +498,27 @@ object RootProxyManager {
      * - proxy mode: only the selected apps are captured.
      */
     private fun buildMangleMarking(
-        cmd: String,
+        stage: RuleStager,
+        v6: Boolean,
         appUid: Int,
         perAppEnabled: Boolean,
         bypassApps: Boolean,
         selectedUids: List<String>,
     ): String {
+        val m = mangle(stage, v6)
         val allowMode = perAppEnabled && !bypassApps
         val bypassSelected = perAppEnabled && bypassApps && selectedUids.isNotEmpty()
         return buildString {
-            appendLine("$cmd -t mangle -N $CHAIN 2>/dev/null || true")
-            appendLine("$cmd -t mangle -F $CHAIN")
+            m.chain(CHAIN)
+            m.flush(CHAIN)
             // the app's own core traffic (the real outbound) must not loop back into the tun.
             // The $FWMARK RETURN is kept defensively (hev itself only talks to loopback, which
             // the 127.0.0.0/8 bypass below already RETURNs).
-            appendLine("$cmd -t mangle -A $CHAIN -m mark --mark $FWMARK -j RETURN")
-            appendLine("$cmd -t mangle -A $CHAIN -m owner --uid-owner $appUid -j RETURN")
+            m.append(CHAIN, "-m mark --mark $FWMARK -j RETURN")
+            m.append(CHAIN, "-m owner --uid-owner $appUid -j RETURN")
             // bypass mode: selected apps go fully direct (incl their DNS)
             if (bypassSelected) {
-                selectedUids.forEach { appendLine("$cmd -t mangle -A $CHAIN -m owner --uid-owner $it -j RETURN") }
+                selectedUids.forEach { m.append(CHAIN, "-m owner --uid-owner $it -j RETURN") }
             }
             // Route DNS through the core for ALL modes, with no uid filter. On Android the
             // DNS query is sent by netd (a shared system uid) on behalf of the app, not under
@@ -396,25 +527,25 @@ object RootProxyManager {
             // LAN/router resolver (192.168.x / 10.x) would be returned direct and resolved by
             // the local ISP resolver (DNS leak + CDN mis-resolution, e.g. Instagram media).
             // The MARK survives a later RETURN, so the marked query still routes into the tun.
-            appendLine("$cmd -t mangle -A $CHAIN -p udp --dport 53 -j MARK --set-xmark $MARK")
-            appendLine("$cmd -t mangle -A $CHAIN -p tcp --dport 53 -j MARK --set-xmark $MARK")
+            m.append(CHAIN, "-p udp --dport 53 -j MARK --set-xmark $MARK")
+            m.append(CHAIN, "-p tcp --dport 53 -j MARK --set-xmark $MARK")
             // keep LAN / private destinations direct (per-family CIDR list)
-            val cidrs = if (cmd.startsWith("ip6tables")) bypassCidrsV6 else bypassCidrs
-            cidrs.forEach { appendLine("$cmd -t mangle -A $CHAIN -d $it -j RETURN") }
+            val cidrs = if (v6) bypassCidrsV6 else bypassCidrs
+            cidrs.forEach { m.append(CHAIN, "-d $it -j RETURN") }
             if (allowMode) {
                 // Proxy ONLY the explicitly selected apps. If nothing resolved (e.g. the
                 // selected packages failed to resolve to uids at early boot), mark nothing
                 // instead of falling through to the catch-all below: a fail-open here would
                 // tunnel every unselected app — both a privacy leak and the "per-app proxies
                 // everything after a reboot" bug.
-                selectedUids.forEach { appendLine("$cmd -t mangle -A $CHAIN -m owner --uid-owner $it -j MARK --set-xmark $MARK") }
+                selectedUids.forEach { m.append(CHAIN, "-m owner --uid-owner $it -j MARK --set-xmark $MARK") }
             } else {
                 // all-apps mode (per-app off) or bypass mode: capture EVERY remaining uid
                 // (incl uid 0 + system uids)
-                appendLine("$cmd -t mangle -A $CHAIN -j MARK --set-xmark $MARK")
+                m.append(CHAIN, "-j MARK --set-xmark $MARK")
             }
-            appendLine("$cmd -t mangle -D OUTPUT -j $CHAIN 2>/dev/null || true")
-            appendLine("$cmd -t mangle -A OUTPUT -j $CHAIN")
+            
+            m.jump("OUTPUT", CHAIN)
         }
     }
 
@@ -434,16 +565,19 @@ object RootProxyManager {
      *
      * Uses the same resolver-selection logic as [buildLanShareSetup].
      */
-    private fun buildDnsDnat(cmd: String): String {
+    private fun buildDnsDnat(stage: RuleStager, v6: Boolean = false): String {
         val dnsChain = AppConfig.ROOT_DNS_OUT_CHAIN
+        val n = nat(stage)
         return buildString {
-            appendLine("$cmd -t nat -N $dnsChain 2>/dev/null || true")
-            appendLine("$cmd -t nat -F $dnsChain")
-            // DNS is captured by the mangle MARK in buildMangleMarking and resolved by the core,
-            // which honours the app's own DNS settings (udp / tcp / doh / doq). Rewriting queries
-            // to a fixed plaintext resolver here would override that choice and leak the query.
-            appendLine("$cmd -t nat -D OUTPUT -j $dnsChain 2>/dev/null || true")
-            appendLine("$cmd -t nat -A OUTPUT -j $dnsChain")
+            if (!v6) {
+                n.chain(dnsChain)
+                n.flush(dnsChain)
+                // DNS is captured by the mangle MARK in buildMangleMarking and resolved by the core,
+                // which honours the app's own DNS settings (udp / tcp / doh / doq). Rewriting queries
+                // to a fixed plaintext resolver here would override that choice and leak the query.
+                
+                n.jump("OUTPUT", dnsChain)
+            }
         }
     }
 
@@ -460,37 +594,38 @@ object RootProxyManager {
      * selected apps lose v6 (everything else stays fully direct).
      */
     private fun buildV6Blackhole(
+        stage: RuleStager,
         appUid: Int,
         perAppEnabled: Boolean,
         bypassApps: Boolean,
         selectedUids: List<String>,
     ): String {
         val chain = AppConfig.ROOT_V6_CHAIN
+        val f = filter(stage, v6 = true)
         val allowMode = perAppEnabled && !bypassApps
         val bypassSelected = perAppEnabled && bypassApps && selectedUids.isNotEmpty()
-        val reject = "-j REJECT --reject-with icmp6-adm-prohibited"
         return buildString {
-            appendLine("ip6tables -w 10 -t filter -N $chain 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t filter -F $chain")
+            f.chain(chain)
+            f.flush(chain)
             // never touch the helper, the core, loopback, NDP/link-local/multicast or LAN
-            appendLine("ip6tables -w 10 -t filter -A $chain -m mark --mark $FWMARK -j RETURN")
-            appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $appUid -j RETURN")
-            appendLine("ip6tables -w 10 -t filter -A $chain -o lo -j RETURN")
-            bypassCidrsV6.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -d $it -j RETURN") }
+            f.append(chain, "-m mark --mark $FWMARK -j RETURN")
+            f.append(chain, "-m owner --uid-owner $appUid -j RETURN")
+            f.append(chain, "-o lo -j RETURN")
+            bypassCidrsV6.forEach { f.append(chain, "-d $it -j RETURN") }
             // bypass mode: bypassed apps keep their native v6
             if (bypassSelected) {
-                selectedUids.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $it -j RETURN") }
+                selectedUids.forEach { f.append(chain, "-m owner --uid-owner $it -j RETURN") }
             }
             if (allowMode) {
                 // proxy mode: only the selected apps lose v6 (so they fall back to v4-via-proxy).
                 // None resolved -> reject nothing, mirroring the v4 chain's fail-closed handling.
-                selectedUids.forEach { appendLine("ip6tables -w 10 -t filter -A $chain -m owner --uid-owner $it $reject") }
+                selectedUids.forEach { f.append(chain, "-m owner --uid-owner $it -j REJECT --reject-with icmp6-adm-prohibited") }
             } else {
                 // all-apps / bypass: reject everyone left
-                appendLine("ip6tables -w 10 -t filter -A $chain $reject")
+                f.append(chain, "-j REJECT --reject-with icmp6-adm-prohibited")
             }
-            appendLine("ip6tables -w 10 -t filter -D OUTPUT -j $chain 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t filter -A OUTPUT -j $chain")
+            
+            f.jump("OUTPUT", chain)
         }
     }
 
@@ -502,11 +637,16 @@ object RootProxyManager {
      * Mirrors Magic_V2Ray's hotspot rules (FORWARD accept, DNS DNAT, source-based policy
      * routing for private client ranges, MSS clamp).
      */
-    private fun buildLanShareSetup(captureDeviceTraffic: Boolean, ipv6: Boolean): String {
+    private fun buildLanShareSetup(stage: RuleStager, captureDeviceTraffic: Boolean, ipv6: Boolean): String {
         val fwd = AppConfig.ROOT_FWD_CHAIN
         val dnsChain = AppConfig.ROOT_DNS_CHAIN
         val v6fwd = AppConfig.ROOT_V6_FWD_CHAIN
         val v6pre = AppConfig.ROOT_V6_PRE_CHAIN
+        val f = filter(stage, v6 = false)
+        val f6 = filter(stage, v6 = true)
+        val n = nat(stage)
+        val m4 = mangle(stage)
+        val m6 = mangle(stage, v6 = true)
         // Use the app's configured remote DNS (first plain IPv4) as the DNAT target for
         // tethered clients; fall back to the default when it's a DoH/DoT/IPv6 value that
         // can't be a DNAT target.
@@ -518,24 +658,25 @@ object RootProxyManager {
             appendLine("set +e")
             appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true")
             // forward traffic to/from the tun
-            appendLine("iptables -w 10 -N $fwd 2>/dev/null || true")
-            appendLine("iptables -w 10 -F $fwd")
-            appendLine("iptables -w 10 -A $fwd -i $TUN -j ACCEPT")
-            appendLine("iptables -w 10 -A $fwd -o $TUN -j ACCEPT")
-            appendLine("iptables -w 10 -D FORWARD -j $fwd 2>/dev/null || true")
-            appendLine("iptables -w 10 -I FORWARD -j $fwd")
+            f.chain(fwd)
+            f.flush(fwd)
+            f.append(fwd, "-i $TUN -j ACCEPT")
+            f.append(fwd, "-o $TUN -j ACCEPT")
+
+            f.replace("FORWARD", "-j $fwd")
             // clamp MSS to avoid TLS fragmentation overhead through the tunnel
-            appendLine("iptables -w 10 -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
-            appendLine("iptables -w 10 -t mangle -A FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350")
+            val mss = "-o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350"
+
+            m4.replace("FORWARD", mss)
             // hijack tethered clients' DNS into a dedicated chain so it resolves through the
             // tunnel; the chain keeps teardown independent of the resolver IP
-            appendLine("iptables -w 10 -t nat -N $dnsChain 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -F $dnsChain")
+            n.chain(dnsChain)
+            n.flush(dnsChain)
             lanCidrs.forEach {
-                appendLine("iptables -w 10 -t nat -A $dnsChain ! -i $TUN -d $it -p udp --dport 53 -j DNAT --to $dns")
+                n.append(dnsChain, "! -i $TUN -d $it -p udp --dport 53 -j DNAT --to $dns")
             }
-            appendLine("iptables -w 10 -t nat -D PREROUTING -j $dnsChain 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -A PREROUTING -j $dnsChain")
+            
+            n.jump("PREROUTING", dnsChain)
             // policy routing: return-path via main, LAN direct, the rest via the tun table
             appendLine("ip rule add iif lo goto 6000 pref 5000 2>/dev/null || true")
             appendLine("ip rule add iif $TUN lookup main suppress_prefixlength 0 pref 5010 2>/dev/null || true")
@@ -553,10 +694,10 @@ object RootProxyManager {
             // above don't touch it, so it egresses the upstream interface directly, bypassing
             // the proxy = IPv6 leak. Handle it explicitly (mirrors vincentng295/Magic_V2Ray
             // cae4f7f): route it through the tun when v6 is enabled, reject it when it isn't.
-            appendLine("ip6tables -w 10 -N $v6fwd 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -F $v6fwd")
-            appendLine("ip6tables -w 10 -D FORWARD -j $v6fwd 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -I FORWARD -j $v6fwd")
+            f6.chain(v6fwd)
+            f6.flush(v6fwd)
+            
+            f6.replace("FORWARD", "-j $v6fwd")
             if (ipv6) {
                 // When the device itself isn't capturing v6 (VPN-mode sharing) the tun table
                 // has no v6 default and the tun has no v6 address — add them so marked client
@@ -567,27 +708,27 @@ object RootProxyManager {
                     appendLine("ip -6 rule add fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
                 }
                 // allow forwarding to/from the tun
-                appendLine("ip6tables -w 10 -A $v6fwd -i $TUN -j ACCEPT")
-                appendLine("ip6tables -w 10 -A $v6fwd -o $TUN -j ACCEPT")
+                f6.append(v6fwd, "-i $TUN -j ACCEPT")
+                f6.append(v6fwd, "-o $TUN -j ACCEPT")
                 // mark forwarded (non-locally-sourced) client v6 into the tun table. DNS first
                 // so a query to a LAN/router resolver is still tunneled (MARK survives RETURN);
                 // keep loopback, link-local (NDP/RA) and ULA/multicast direct.
-                appendLine("ip6tables -w 10 -t mangle -N $v6pre 2>/dev/null || true")
-                appendLine("ip6tables -w 10 -t mangle -F $v6pre")
-                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -p udp --dport 53 -j MARK --set-xmark $MARK")
-                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -p tcp --dport 53 -j MARK --set-xmark $MARK")
-                bypassCidrsV6.forEach { appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -d $it -j RETURN") }
-                appendLine("ip6tables -w 10 -t mangle -A $v6pre ! -i $TUN -j MARK --set-xmark $MARK")
-                appendLine("ip6tables -w 10 -t mangle -D PREROUTING -j $v6pre 2>/dev/null || true")
-                appendLine("ip6tables -w 10 -t mangle -A PREROUTING -j $v6pre")
+                m6.chain(v6pre)
+                m6.flush(v6pre)
+                m6.append(v6pre, "! -i $TUN -p udp --dport 53 -j MARK --set-xmark $MARK")
+                m6.append(v6pre, "! -i $TUN -p tcp --dport 53 -j MARK --set-xmark $MARK")
+                bypassCidrsV6.forEach { m6.append(v6pre, "! -i $TUN -d $it -j RETURN") }
+                m6.append(v6pre, "! -i $TUN -j MARK --set-xmark $MARK")
+                
+                m6.jump("PREROUTING", v6pre)
                 // fail closed: any forwarded v6 that wasn't marked into the tun (e.g. the
                 // addrtype match is unavailable, or marking failed) is rejected rather than
                 // leaked straight out the upstream interface.
-                appendLine("ip6tables -w 10 -A $v6fwd -j REJECT --reject-with icmp6-no-route")
+                f6.append(v6fwd, "-j REJECT --reject-with icmp6-no-route")
             } else {
                 // v6 disabled: reject forwarded clients' native v6 so it can't leak past the
                 // proxy (the device's own v6 is blackholed separately in OUTPUT).
-                appendLine("ip6tables -w 10 -A $v6fwd -j REJECT --reject-with icmp6-no-route")
+                f6.append(v6fwd, "-j REJECT --reject-with icmp6-no-route")
             }
         }
     }
@@ -657,41 +798,42 @@ object RootProxyManager {
     private fun buildTeardownBody(context: Context): String {
         val runDir = File(context.filesDir, AppConfig.ROOT_RUNTIME_DIR)
         val pidFile = File(runDir, "tun2socks.pid").absolutePath
+        val stage = RuleStager()
+        val m4 = mangle(stage)
+        val m6 = mangle(stage, v6 = true)
         return buildString {
             // mangle (TUN2SOCKS), both families
-            for (cmd in listOf("iptables -w 10", "ip6tables -w 10")) {
-                appendLine("$cmd -t mangle -D OUTPUT -j $CHAIN 2>/dev/null || true")
-                appendLine("$cmd -t mangle -F $CHAIN 2>/dev/null || true")
-                appendLine("$cmd -t mangle -X $CHAIN 2>/dev/null || true")
-            }
-            // IPv6 blackhole chain (only set up when v6 is disabled; harmless if absent)
-            appendLine("ip6tables -w 10 -t filter -D OUTPUT -j ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t filter -F ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t filter -X ${AppConfig.ROOT_V6_CHAIN} 2>/dev/null || true")
+            m4.dropAll("OUTPUT", "-j $CHAIN")
+            m4.delete(CHAIN)
+            m6.dropAll("OUTPUT", "-j $CHAIN")
+            m6.delete(CHAIN)
             // routing rule + table
             appendLine("ip rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip -6 rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip route flush table $TABLE 2>/dev/null || true")
             appendLine("ip -6 route flush table $TABLE 2>/dev/null || true")
+            // IPv6 blackhole chain (only set up when v6 is disabled; harmless if absent)
+            val f6 = filter(stage, v6 = true)
+            f6.dropAll("OUTPUT", "-j ${AppConfig.ROOT_V6_CHAIN}")
+            f6.delete(AppConfig.ROOT_V6_CHAIN)
             // LAN / tethering sharing (always cleaned, harmless if it was never set up)
-            appendLine("iptables -w 10 -D FORWARD -j ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -F ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -X ${AppConfig.ROOT_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -t mangle -D FORWARD -o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -D PREROUTING -j ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -F ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -X ${AppConfig.ROOT_DNS_CHAIN} 2>/dev/null || true")
+            val f4 = filter(stage, v6 = false)
+            f4.dropAll("FORWARD", "-j ${AppConfig.ROOT_FWD_CHAIN}")
+            f4.delete(AppConfig.ROOT_FWD_CHAIN)
+            m4.dropAll("FORWARD", "-o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350")
+            val n = nat(stage)
+            n.dropAll("PREROUTING", "-j ${AppConfig.ROOT_DNS_CHAIN}")
+            n.delete(AppConfig.ROOT_DNS_CHAIN)
             // device DNS DNAT chain (root mode)
-            appendLine("iptables -w 10 -t nat -D OUTPUT -j ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -F ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
-            appendLine("iptables -w 10 -t nat -X ${AppConfig.ROOT_DNS_OUT_CHAIN} 2>/dev/null || true")
+            n.dropAll("OUTPUT", "-j ${AppConfig.ROOT_DNS_OUT_CHAIN}")
+            n.delete(AppConfig.ROOT_DNS_OUT_CHAIN)
             // IPv6 LAN-sharing chains (forward accept/reject + forwarded-client marking)
-            appendLine("ip6tables -w 10 -D FORWARD -j ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -F ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -X ${AppConfig.ROOT_V6_FWD_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t mangle -D PREROUTING -j ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t mangle -F ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
-            appendLine("ip6tables -w 10 -t mangle -X ${AppConfig.ROOT_V6_PRE_CHAIN} 2>/dev/null || true")
+            f6.dropAll("FORWARD", "-j ${AppConfig.ROOT_V6_FWD_CHAIN}")
+            f6.delete(AppConfig.ROOT_V6_FWD_CHAIN)
+            m6.dropAll("PREROUTING", "-j ${AppConfig.ROOT_V6_PRE_CHAIN}")
+            m6.delete(AppConfig.ROOT_V6_PRE_CHAIN)
+            appendLine("set +e")
+            append(restorePreamble(stage, strict = false))
             for (pref in listOf(5000, 5010, 5020, 5025, 5026, 5027, 5030, 5040, 5050, 6000)) {
                 appendLine("ip rule del pref $pref 2>/dev/null || true")
             }
