@@ -80,6 +80,9 @@ object RootProxyManager {
          */
         val drops = mutableListOf<String>()
 
+        /** Chain deletions, run after the batch by the same reasoning as [drops]. */
+        val deletes = mutableListOf<String>()
+
         /**
          * Built-in chains are declared with their default policy, user chains with the `-`
          * marker. A chain declared here exists for the rest of the batch even if this run is
@@ -94,10 +97,16 @@ object RootProxyManager {
             lines.add("-F $chain")
         }
 
-        /** Delete [chain]; the `:` declaration makes the -X a no-op when it never existed. */
+        /**
+         * Delete [chain], flushing it first: `-X` refuses a chain that still has rules ("Directory
+         * not empty"). Deletion runs after the batch as a best-effort command because restore only
+         * lets `-X` follow a chain declared with `:name -` when that chain already existed, so
+         * declaring it to make -X safe would also make -X a no-op on a chain a previous run
+         * created. Measured: CORE_FWD survived every teardown.
+         */
         fun delete(chain: String) {
-            chain(chain)
-            lines.add("-X $chain")
+            deletes.add("-F $chain")
+            deletes.add("-X $chain")
         }
 
         /** Best-effort removal of a leftover rule, run outside the restore batch. */
@@ -143,17 +152,22 @@ object RootProxyManager {
 
         fun script(): String = buildString {
             for ((_, b) in batches) {
-                if (b.lines.isEmpty()) continue
-                // Drops run first, unwrapped: a missing rule is the normal case on a fresh
-                // start. Each one is already guarded by the caller's `|| true`.
+                // Drops and deletes run unwrapped, around their batch: a missing rule or chain
+                // is the normal case on a fresh start, and each one is guarded by `|| true`.
+                // Drops come first so no chain is still jumped into when its -X runs.
                 if (b.drops.isNotEmpty()) {
                     b.drops.forEach { appendLine("${b.tool} -w 10 -t ${b.table} $it 2>/dev/null || true") }
                 }
-                appendLine("restore ${b.tool.replace("-", "_")} ${b.table.replace("-", "_")} <<'IPT_EOF'")
-                appendLine("*${b.table}")
-                b.lines.forEach { appendLine(it) }
-                appendLine("COMMIT")
-                appendLine("IPT_EOF")
+                if (b.lines.isNotEmpty()) {
+                    appendLine("restore ${b.tool.replace("-", "_")} ${b.table.replace("-", "_")} <<'IPT_EOF'")
+                    appendLine("*${b.table}")
+                    b.lines.forEach { appendLine(it) }
+                    appendLine("COMMIT")
+                    appendLine("IPT_EOF")
+                }
+                if (b.deletes.isNotEmpty()) {
+                    b.deletes.forEach { appendLine("${b.tool} -w 10 -t ${b.table} $it 2>/dev/null || true") }
+                }
             }
         }
     }
@@ -162,6 +176,7 @@ object RootProxyManager {
         stage.batch(if (v6) "ip6tables" else "iptables", "mangle")
 
     private fun nat(stage: RuleStager) = stage.batch("iptables", "nat")
+
 
     private fun filter(stage: RuleStager, v6: Boolean) =
         stage.batch(if (v6) "ip6tables" else "iptables", "filter")
@@ -639,6 +654,10 @@ object RootProxyManager {
      */
     private fun buildLanShareSetup(stage: RuleStager, captureDeviceTraffic: Boolean, ipv6: Boolean): String {
         val fwd = AppConfig.ROOT_FWD_CHAIN
+        // The accept rules are per-connect, not per-config: keeping them in their own chain
+        // lets teardown delete and recreate it on every connect instead of re-inserting a jump
+        // into FORWARD that then piles up (13 copies were measured after 13 connects).
+        val lanChain = "${AppConfig.ROOT_FWD_CHAIN}_LAN"
         val dnsChain = AppConfig.ROOT_DNS_CHAIN
         val v6fwd = AppConfig.ROOT_V6_FWD_CHAIN
         val v6pre = AppConfig.ROOT_V6_PRE_CHAIN
@@ -658,10 +677,10 @@ object RootProxyManager {
             appendLine("set +e")
             appendLine("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true")
             // forward traffic to/from the tun
-            f.chain(fwd)
-            f.flush(fwd)
-            f.append(fwd, "-i $TUN -j ACCEPT")
-            f.append(fwd, "-o $TUN -j ACCEPT")
+            f.chain(lanChain)
+            f.flush(lanChain)
+            f.append(lanChain, "-i $TUN -j ACCEPT")
+            f.append(lanChain, "-o $TUN -j ACCEPT")
 
             f.replace("FORWARD", "-j $fwd")
             // clamp MSS to avoid TLS fragmentation overhead through the tunnel
@@ -801,44 +820,47 @@ object RootProxyManager {
         val stage = RuleStager()
         val m4 = mangle(stage)
         val m6 = mangle(stage, v6 = true)
+        val f6 = filter(stage, v6 = true)
+        val f4 = filter(stage, v6 = false)
+        val lanChain = "${AppConfig.ROOT_FWD_CHAIN}_LAN"
+        val mss = "-o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350"
+        // The forwarding chains hold `-i/-o $TUN -j ACCEPT`, the only rules the forward path
+        // needs. Dropping them before the packet path is closed would leave a window where the
+        // tunnel is still routed but its traffic is no longer accepted, so jumps go first and
+        // every chain is deleted last, once nothing can jump into it any more.
         return buildString {
-            // mangle (TUN2SOCKS), both families
+            // drops into the built-in chains, so no chain below is still referenced
             m4.dropAll("OUTPUT", "-j $CHAIN")
-            m4.delete(CHAIN)
             m6.dropAll("OUTPUT", "-j $CHAIN")
+            f6.dropAll("OUTPUT", "-j ${AppConfig.ROOT_V6_CHAIN}")
+            f4.dropAll("FORWARD", "-j ${AppConfig.ROOT_FWD_CHAIN}")
+            f4.dropAll("FORWARD", "-j $lanChain")
+            m4.dropAll("FORWARD", mss)
+            nat(stage).dropAll("PREROUTING", "-j ${AppConfig.ROOT_DNS_CHAIN}")
+            nat(stage).dropAll("OUTPUT", "-j ${AppConfig.ROOT_DNS_OUT_CHAIN}")
+            f6.dropAll("FORWARD", "-j ${AppConfig.ROOT_V6_FWD_CHAIN}")
+            m6.dropAll("PREROUTING", "-j ${AppConfig.ROOT_V6_PRE_CHAIN}")
+            // chains, deleted last inside each batch once nothing jumps into them
+            m4.delete(CHAIN)
             m6.delete(CHAIN)
-            // routing rule + table
+            f6.delete(AppConfig.ROOT_V6_CHAIN)
+            f4.delete(AppConfig.ROOT_FWD_CHAIN)
+            f4.delete(lanChain)
+            nat(stage).delete(AppConfig.ROOT_DNS_CHAIN)
+            nat(stage).delete(AppConfig.ROOT_DNS_OUT_CHAIN)
+            f6.delete(AppConfig.ROOT_V6_FWD_CHAIN)
+            m6.delete(AppConfig.ROOT_V6_PRE_CHAIN)
+            // routing rules + tables
             appendLine("ip rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip -6 rule del fwmark $MARK table $TABLE priority $PRIORITY 2>/dev/null || true")
             appendLine("ip route flush table $TABLE 2>/dev/null || true")
             appendLine("ip -6 route flush table $TABLE 2>/dev/null || true")
-            // IPv6 blackhole chain (only set up when v6 is disabled; harmless if absent)
-            val f6 = filter(stage, v6 = true)
-            f6.dropAll("OUTPUT", "-j ${AppConfig.ROOT_V6_CHAIN}")
-            f6.delete(AppConfig.ROOT_V6_CHAIN)
-            // LAN / tethering sharing (always cleaned, harmless if it was never set up)
-            val f4 = filter(stage, v6 = false)
-            f4.dropAll("FORWARD", "-j ${AppConfig.ROOT_FWD_CHAIN}")
-            f4.delete(AppConfig.ROOT_FWD_CHAIN)
-            m4.dropAll("FORWARD", "-o $TUN -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1350")
-            val n = nat(stage)
-            n.dropAll("PREROUTING", "-j ${AppConfig.ROOT_DNS_CHAIN}")
-            n.delete(AppConfig.ROOT_DNS_CHAIN)
-            // device DNS DNAT chain (root mode)
-            n.dropAll("OUTPUT", "-j ${AppConfig.ROOT_DNS_OUT_CHAIN}")
-            n.delete(AppConfig.ROOT_DNS_OUT_CHAIN)
-            // IPv6 LAN-sharing chains (forward accept/reject + forwarded-client marking)
-            f6.dropAll("FORWARD", "-j ${AppConfig.ROOT_V6_FWD_CHAIN}")
-            f6.delete(AppConfig.ROOT_V6_FWD_CHAIN)
-            m6.dropAll("PREROUTING", "-j ${AppConfig.ROOT_V6_PRE_CHAIN}")
-            m6.delete(AppConfig.ROOT_V6_PRE_CHAIN)
+            appendLine("ip link set dev $TUN down 2>/dev/null || true")
             appendLine("set +e")
             append(restorePreamble(stage, strict = false))
             for (pref in listOf(5000, 5010, 5020, 5025, 5026, 5027, 5030, 5040, 5050, 6000)) {
                 appendLine("ip rule del pref $pref 2>/dev/null || true")
             }
-            // tun device down + helper process
-            appendLine("ip link set dev $TUN down 2>/dev/null || true")
             appendLine("[ -f '$pidFile' ] && kill \$(cat '$pidFile') 2>/dev/null || true")
             appendLine("rm -f '$pidFile'")
         }
