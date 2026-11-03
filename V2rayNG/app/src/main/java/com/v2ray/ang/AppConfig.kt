@@ -248,6 +248,15 @@ object AppConfig {
     const val ROOT_V6_FWD_CHAIN = "CORE6_FWD" // ip6tables FORWARD chain: route or reject tethered clients' native IPv6
     const val ROOT_V6_PRE_CHAIN = "CORE6_PRE" // ip6tables mangle/PREROUTING chain: mark forwarded clients' IPv6 into the tun
     const val ROOT_LAN_DNS = "1.1.1.1"          // fallback resolver for tethered clients when no plain-IPv4 DNS is configured
+
+    /**
+     * Where the device's own DNS queries are sent on leaving OUTPUT. netd resolves against
+     * whatever the upstream network hands out, which on some carriers is an address reachable
+     * only from inside their own network (VinaPhone: 10.201.135.254). Forwarded into the tun
+     * those queries never answer, so every app's DNS hangs; rewritten to a public address they
+     * still reach the core, which then resolves them through the configured DoH/DoT resolver.
+     */
+    const val ROOT_DNS_REDIRECT = "1.1.1.1"
     const val ROOT_OOM_SCORE = "-1000"          // oom_score_adj that makes the LMK never kill us
 
     /** hev-sock5-tunnel read-write-timeout value */

@@ -87,9 +87,13 @@ object RootProxyManager {
          * Built-in chains are declared with their default policy, user chains with the `-`
          * marker. A chain declared here exists for the rest of the batch even if this run is
          * what creates it, so the -F that follows cannot fail on a first-time setup.
+         *
+         * Declarations go to the front of the batch: restore resolves `-j` against what is
+         * already declared, so a `:` line that arrives after the jump to it is too late.
          */
         fun chain(chain: String, policy: String = "-") {
-            if (lines.none { it.startsWith(":$chain ") }) lines.add(":$chain $policy")
+            val decl = ":$chain $policy"
+            if (lines.none { it.startsWith(":$chain ") }) lines.add(0, decl)
         }
 
         fun flush(chain: String) {
@@ -127,16 +131,41 @@ object RootProxyManager {
 
         fun insert(chain: String, rule: String) = lines.add("-I $chain $rule")
 
-        /** Jump into [target], replacing any leftover jump from a previous run. */
+        /**
+         * Declare [target] before anything jumps to it. Restore resolves `-j` against the
+         * chains the kernel knows when the line runs, so a jump to a chain this batch creates
+         * aborts with "Couldn't find target" unless the `:` line already declared it - which
+         * silently dropped the whole nat/filter batch while the script still exited 0.
+         */
         fun jump(chain: String, target: String) {
+            if (target in OWN_CHAINS) chain(target)
             drop(chain, "-j $target")
             append(chain, "-j $target")
         }
 
         /** Assert [rule] once, replacing the copy a previous run left behind. */
         fun replace(chain: String, rule: String) {
+            chainJumpTarget(rule)?.let { chain(it) }
             drop(chain, rule)
             append(chain, rule)
+        }
+
+        private fun chainJumpTarget(rule: String): String? =
+            rule.split(' ').let { tok -> tok.getOrNull(tok.indexOf("-j") + 1) }
+                ?.takeIf { it in OWN_CHAINS }
+
+        companion object {
+            /** Every chain this class may create; only these need a `:` line before a jump. */
+            val OWN_CHAINS = setOf(
+                CHAIN,
+                AppConfig.ROOT_FWD_CHAIN,
+                "${AppConfig.ROOT_FWD_CHAIN}_LAN",
+                AppConfig.ROOT_DNS_CHAIN,
+                AppConfig.ROOT_DNS_OUT_CHAIN,
+                AppConfig.ROOT_V6_CHAIN,
+                AppConfig.ROOT_V6_FWD_CHAIN,
+                AppConfig.ROOT_V6_PRE_CHAIN,
+            )
         }
     }
 
@@ -583,14 +612,18 @@ object RootProxyManager {
     private fun buildDnsDnat(stage: RuleStager, v6: Boolean = false): String {
         val dnsChain = AppConfig.ROOT_DNS_OUT_CHAIN
         val n = nat(stage)
+        // What netd actually resolves against. On VinaPhone that is 10.201.135.254: reachable
+        // only from the carrier's own network, so a query forwarded into the tun times out
+        // (measured 8 s, while DoH to 1.1.1.1 through the same tun answers in 1.4 s) and every
+        // app's DNS dies. Received here, the query is routed by the core to dns-out, honouring
+        // the udp/tcp/doh/doq resolver the user configured.
+        val resolver = AppConfig.ROOT_DNS_REDIRECT
         return buildString {
             if (!v6) {
                 n.chain(dnsChain)
                 n.flush(dnsChain)
-                // DNS is captured by the mangle MARK in buildMangleMarking and resolved by the core,
-                // which honours the app's own DNS settings (udp / tcp / doh / doq). Rewriting queries
-                // to a fixed plaintext resolver here would override that choice and leak the query.
-                
+                n.append(dnsChain, "-p udp --dport 53 -j DNAT --to-destination $resolver")
+                n.append(dnsChain, "-p tcp --dport 53 -j DNAT --to-destination $resolver")
                 n.jump("OUTPUT", dnsChain)
             }
         }
